@@ -1,0 +1,240 @@
+name: Configure - EC2s
+on: workflow_dispatch
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  NAME_PREFIX: "STELM21BI"
+  ENVIRONMENT_TYPE: "CM"
+  ENVIRONMENT: "stg"
+  S3_SETUP_BUCKET_NAME: "stg-ibi-rweblogs-plat-s3-setup-463470978100"
+  CROWDSTRIKE_INSTALLER: "WindowsCrowdStrike.exe"
+  NESSUS_INSTALL_PATH: "C:\\Agents\\NessusAgent.msi"
+  PROXY_HOSTNAME: "109.232.46.212.92"
+  PROXY_PORT: "443"
+  SQL_VERSION: "2022-Developer"
+  AWS_REGION: "eu-west-3"
+
+jobs:
+  invoke_create_ous:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ["self-hosted", "stg"]
+    environment:
+      name: stg
+    steps:
+      - name: Git config
+        run: |
+          git config --global url."https://token:${{secrets.RUNNER_BEARER_TOKEN}}@github.com/exilsgroup".insteadOf "https://github.com/exilsgroup"
+          git config --files.gitmodules github-runner.url https://token:${{secrets.RUNNER_BEARER_TOKEN}}@github.com/exilsgroup/github-runner.git
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.RUNNER_BEARER_TOKEN }}
+      - name: Call the pd_ad_action - updating the OU, Groups and Users
+        uses: ./business-intelligence/actions/ad_update
+        with:
+          pd-number: "ibi"
+          default-secret-name: ${{ secrets.S3_DEFAULT_AD_SECRET_NAME }}
+          environment-type: "CM"
+          authaccessgroup: "ibi-auth-do"
+
+  install_nexus:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ["self-hosted", "stg"]
+    needs: ["invoke_create_ous"]
+    environment:
+      name: stg
+    strategy:
+      matrix:
+        hosts: ["SRS001", "SIS001", "SAS001", "MGT001"]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.RUNNER_BEARER_TOKEN }}
+      - name: install_nexus
+        uses: ./github-runner/actions/install_nexus
+        with:
+          server-name: ${{ env.NAME_PREFIX }}${{ matrix.hosts }}
+          pd-number: ${{ matrix.hosts }}
+          full-domain-name: ${{ secrets.FULL_DOMAIN_NAME }}
+          server-hostname: ""
+          install-source: ${{ env.NEXUS_INSTALL_PATH }}
+          key: ${{ secrets.NEXUS_KEY }}
+          proxy-hostname: ${{ env.PROXY_HOSTNAME }}
+          proxy-port: ${{ env.PROXY_PORT }}
+
+  install_crowdstrike:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: ["install_nexus"]
+    environment:
+      name: stg
+    strategy:
+      matrix:
+        hosts: 
+          - name: "SRS001"
+            server-type: "DG"
+          - name: "SIS001"
+            server-type: "DG"
+          - name: "SAS001"
+            server-type: "DG"
+          - name: "MGT001"
+            server-type: "MGMT"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.RUNNER_BEARER_TOKEN }}
+      - name: install_crowdstrike
+        uses: ./github-runner/actions/install_crowdstrike
+        with:
+          server-prefix: ${{ env.NAME_PREFIX }}
+          pd-number: ${{ matrix.hosts.name }}
+          full-domain-name: ${{ secrets.FULL_DOMAIN_NAME }}
+          server-hostname: ""
+          environment-type: ${{ env.ENVIRONMENT_TYPE }}
+          server-type: ${{ matrix.hosts.server-type }}
+          install-source: ${{ env.CROWDSTRIKE_INSTALL_PATH }}
+          cid: ${{ secrets.CROWDSTRIKE_CID }}
+          grouping-tag: "ibi"
+
+  install_dynatrace:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: ["install_crowdstrike"]
+    environment:
+      name: stg
+    strategy:
+      matrix:
+        hosts: ["SRS001", "SIS001", "SAS001", "MGT001"]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.RUNNER_BEARER_TOKEN }}
+      - name: install_dynatrace
+        uses: ./github-runner/actions/install_dynatrace
+        with:
+          server-name: ${{ env.NAME_PREFIX }}${{ matrix.hosts }}
+          cost-center: "business-intelligence"
+          product: "business-intelligence"
+
+  copy_sql_installers:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    environment:
+      name: stg
+    strategy:
+      matrix:
+        hosts: ["SRS001", "SIS001", "SAS001"]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOYER_ROLE_ARN }}
+          role-session-name: deploy-role-session
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: navikt/github-app-token-generator@v1.2.0
+        id: get-token
+        with:
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.APP_ID }}
+      - name: Copy SQL installers
+        run: |
+          echo "Copying SQL installers to DGs"
+          NAME=${{ env.NAME_PREFIX}}${{matrix.hosts}}
+          S3BUCKET=${{S3_SETUP_BUCKET_NAME}}
+          SQLVERSION=${{SQL_VERSION}}
+          commandid=$(aws ssm send-command --document-name "AWS-RunPowerShellScript" --targets '[{"Key":"tag:Name","Values":["'$NAME'"]}]' --parameters '{"commands":["$Destination_path = \"C:\\\\Installers\\\"","New-Item -Path \"$($Destination_path)\\\\SQL\\\" -Type Directory -force","Write-Host \"Copying SQL installers to $($Destination_path)\\\\SQL\\\"","Read-S3Object -BucketName \"$S3BUCKET\" -KeyPrefix \"$SQLVERSION\" -folder \"$($Destination_path)\\\\SQL\\\""]}')
+          sleep 180
+        env:
+          OL_TOKEN : ${{ secrets.RUNNER_BEARER_TOKEN }}
+          hosts : ${{ matrix.hosts }}
+
+  copy_ssms_installers:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: ["copy_sql_installers"]
+    environment:
+      name: stg
+    strategy:
+      matrix:
+        hosts: ["SRS001", "SIS001", "SAS001", "MGT001"]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOYER_ROLE_ARN }}
+          role-session-name: deploy-role-session
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: navikt/github-app-token-generator@v1.2.0
+        id: get-token
+        with:
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.APP_ID }}
+      - name: Copy SSMS to MGMT Server
+        run: |
+          echo "Copying SSMS to MGMT Server"
+          NAME=${{ env.NAME_PREFIX}}${{matrix.hosts}}
+          S3BUCKET=${{env.S3_SETUP_BUCKET_NAME}}
+          SQLVERSION=${{env.SQL_VERSION}}
+          commandid=$(aws ssm send-command --document-name "AWS-RunPowerShellScript" --targets '[{"Key":"tag:Name","Values":["'$NAME'"]}]' --parameters '{"commands":["$Destination_path = \"C:\\\\Installers\\\"","New-Item -Path \"$($Destination_path)\\\\connect\" -Type Directory -force","Write-Host \"Copying SSMS to MGMT Server\"","Read-S3Object -BucketName \"$S3BUCKET\" -KeyPrefix \"$SQLVERSION\" -folder \"$($Destination_path)\\\\connect\\\""]}')
+          sleep 180
+        env:
+          OL_TOKEN : ${{ secrets.RUNNER_BEARER_TOKEN }}
+          hosts : ${{ matrix.hosts }}
+
+  configure_wsus:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: ["copy_ssms_installers"]
+    environment:
+      name: stg
+    strategy:
+      matrix:
+        hosts: ["SRS001", "SIS001", "SAS001", "MGT001"]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.RUNNER_BEARER_TOKEN }}
+      - name: configure_wsus
+        uses: ./github-runner/actions/sydney/configure_wsus
+        with:
+          server-name: ${{ env.NAME_PREFIX }}${{ matrix.hosts }}
+          server-fqdn: ${{ env.NAME_PREFIX}}${{ secrets.FULL_DOMAIN_NAME }}
+          server-fqdn-s: STELM2AUSUSDSRT02.${{ secrets.FULL_DOMAIN_NAME }}
+
+  install_wsus:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: ["configure_wsus"]
+    environment:
+      name: stg
+    strategy:
+      matrix:
+        hosts: ["SRS001", "SIS001", "SAS001", "MGT001"]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOYER_ROLE_ARN }}
+          role-session-name: deploy-role-session
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: navikt/github-app-token-generator@v1.2.0
+        id: get-token
+        with:
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.APP_ID }}
+      - name: install_wsus
+        uses: ./github-runner/actions/install_wsus
+        with:
+          server-name: ${{ env.NAME_PREFIX }}${{ matrix.hosts }}
