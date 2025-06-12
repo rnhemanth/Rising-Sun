@@ -1,0 +1,15 @@
+locals {
+  service          = "ibi-eweblogs"
+  service_location = "england"
+  identifier       = "business-intelligence"
+  owner            = "Richard-Lamb"
+  business_unit    = "group-security"
+  product          = "business-intelligence"
+  account_state    = "0"
+  programme_name   = "adelaide"
+  project_name     = "rising-sun"
+  project_code     = "PORTASK0001062"
+  iac_source       = "terraform"
+  dr               = "mission_critical"
+  sub_service      = "aws-business-intelligence"
+}
